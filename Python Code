@@ -1,0 +1,303 @@
+#This file contains multiple scripts to execute and analyze malware samples in the cuckoo sandbox
+
+#
+# This script executes all the curated malware samples in the cuckoo sandbox
+#
+
+import json, os, glob, time
+from cuckoo.core.database import Database
+from cuckoo.misc import decide_cwd
+decide_cwd()
+db = Database()
+directory= '/mnt/malware/samples'
+filetype = ['zip', 'dll', 'exe']
+
+
+
+def complete_run():
+    for package in filetype:
+        current_dir = directory + '/' + package
+        for file in glob.iglob(current_dir + "/*"):
+            if not os.path.basename(file).endswith(".json") and not os.path.basename(file).endswith(".7z"):
+                db.add_path(file, timeout=300, package=package, machine='win7', options="route=internet")
+
+
+db.connect(schema_check=False, create=False)
+complete_run()
+
+
+
+#!/usr/bin/env /usr/bin/python3
+# 
+# This script goes through cuckoo output (json files) and collects DNS names requested during malware runs
+# - used to whitelist traffic for initial malware communications
+#
+import json, os, glob
+
+directory= f'/home/cuckoo/samples/**/*.json'
+dns_requests = []
+for file in glob.glob(directory, recursive=True):
+    with open(file, "r") as report:
+        try:
+            data=json.load(report)
+            dns_requests.extend([i['hostname'] for i in data['additional_info']['behaviour-v1']['network']['dns']])
+        except:
+            continue
+with open('dns_requests.txt', 'a+') as f:
+    for req in sorted(set(dns_requests)):
+        f.write("%s\n" % req)
+
+
+
+#!/usr/bin/env /usr/bin/python3
+#
+# Takes all data from report.json produces datasets comprised of raw counts
+# Uses pcap files to calculate rtt_mean and rtt standard deviations
+# Joins the raw count and rtt data to create the dataset for one run of malware
+#
+import json, os, glob, pyshark, binascii, ipaddress, csv, statistics, itertools
+from pathlib import PurePath
+from collections import Counter
+import pandas as pd
+import argparse
+from concurrent.futures import ProcessPoolExecutor as pe
+
+parser = argparse.ArgumentParser(description="create dataset.")
+parser.add_argument('input_dir', nargs='*', default=f'/home/cuckoo/.cuckoo/storage/analyses', help='directory from which to create the dataset')
+parser.add_argument('-o', '--output_dir', default=f'.', help='directory to which to write the dataset')
+args = parser.parse_args()
+
+
+norm_ips = open("/home/cuckoo/scripts/iplist_final.txt").read().splitlines()
+mw_list = pd.read_csv('/home/cuckoo/scripts/mw_list.csv')
+directory= f'/home/cuckoo/.cuckoo/storage/analyses'
+directories = args.input_dir
+
+def make_cat_data():
+    categories = [ 'crypto', 'exception', 'file', 'misc', 'netapi', 'network', '__notification__',  'ole', 'process', 'registry', 'resource', 'services', 'synchronisation', 'system', 'ui']
+    ignore_ids = list(range(7248,7284))
+    data = []
+    category_counts = None
+    for directory in directories: 
+        for file in glob.iglob(directory + "/**/report.json", recursive=True):
+            with open(file, "r", newline="") as f:
+                try:
+                    init_load = json.load(f)
+                    if init_load['info']['id'] in ignore_ids:
+                        continue
+                    category_count = Counter([call['category'] for process in init_load['behavior']['processes'] for call in process['calls']])
+                    temp_list = [category_count[cat] for cat in categories]
+                    temp_list.insert(0,init_load['info']['id'])
+                    temp_list.insert(1,init_load['target']['file']['name'])
+                    temp_list.insert(2,init_load['info']['machine']['started_on'])
+                    data.append(temp_list)
+                    print("Make Category Data [INFO]: {0}".format(init_load['info']['id']))
+                except Exception as e: 
+                    print("{0} for file {1}".format(repr(e),file))
+                    pass
+    category_counts = pd.DataFrame(data,columns=['tid','filename','date']+categories)
+
+    #Clean Counts data
+    counts = Counter(category_counts.filename)
+    category_counts = category_counts[category_counts.filename.isin([key for key in counts if counts[key] == 2])]
+    return category_counts
+
+
+def make_rtt_data():
+    RTTs = []
+    RTT_data = None
+    for directory in directories:
+        for file in glob.iglob(directory + "/**/*.pcap", recursive=True):
+            if (os.path.basename(file) == "dump_sorted.pcap"):
+                cap = pyshark.FileCapture(file)
+                try:
+                    tid = int(PurePath(file).parts[-2])
+                except:
+                    break
+                for packet in cap:
+                    try:
+                        if 'TCP Layer' in str(packet.layers):
+                            if packet.ip.src.raw_value not in norm_ips:
+                                if packet.tcp.flags.raw_value == '12':
+                                    RTTs.append((tid, packet.sniff_time.strftime("%c"), ipaddress.ip_address(packet.ip.src), float(packet.tcp.analysis_ack_rtt)))
+                                    print("Make RTT Data [INFO]: {0}".format(tid))
+                    except Exception as e:
+                        print(repr(e))
+                        continue
+                print(tid)
+                cap.close()
+    print(RTTs)
+
+    with open("{0}/RTTs.csv".format(args.output_dir), "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerows(RTTs)
+
+
+    csv_header = [ 'tid', 'rtt_mean', 'rtt_sd' ]
+    output = []
+    data = {}
+
+    for line in RTTs:
+        if line[0] in data:
+            data[line[0]].append(float(line[3]))
+        else:
+            data[line[0]] = [float(line[3])]
+    for k,v in data.items():
+        if len(v) > 1:
+            output.append({'tid':k, 'rtt_mean': statistics.mean(v), 'rtt_sd': statistics.stdev(v)})
+        else:
+            output.append({'tid':k, 'rtt_mean': statistics.mean(v), 'rtt_sd': 0})
+    RTT_data = pd.DataFrame(output,columns=['tid','rtt_mean','rtt_sd'])
+    print("RTT info is {0}".format(RTT_data.info))
+    return RTT_data 
+
+if __name__ == "__main__":
+    data = make_cat_data()
+    rtt = make_rtt_data()
+
+    intermediate_output = pd.merge(data, rtt, on='tid', how='left')
+    output = pd.merge(intermediate_output, mw_list, on='filename', how='left')
+    output.to_csv('{0}/counts_data.csv'.format(args.output_dir),index=False)
+
+
+#
+# Calculate RTT Means and RTT Standard Deviations across an entire run of malware
+#
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import statistics
+from scipy import stats
+from statsmodels.stats import rates
+
+
+firstrun = pd.read_csv(r'working/1RTTs.csv')
+secondrun = pd.read_csv(r'working/2RTTs.csv')
+thirdrun = pd.read_csv(r'working/3RTTs.csv')
+fourthrun = pd.read_csv(r'working/4RTTs.csv')
+
+
+print("First Run's RTT Mean: {0}".format(statistics.mean(firstrun['rtt'].dropna())))
+print("Second Run's RTT Mean: {0}".format(statistics.mean(secondrun['rtt'].dropna())))
+print("Third Run's RTT Mean: {0}".format(statistics.mean(thirdrun['rtt'].dropna())))
+print("Fourth Run's RTT Mean: {0}".format(statistics.mean(fourthrun['rtt'].dropna())))
+
+print("First Run's RTT Std Dev: {0}".format(firstrun['rtt'].dropna().std()))
+print("Second Run's RTT Std Dev: {0}".format(secondrun['rtt'].dropna().std()))
+print("Third Run's RTT Std Dev: {0}".format(thirdrun['rtt'].dropna().std()))
+print("Fourth Run's RTT Std Dev: {0}".format(fourthrun['rtt'].dropna().std()))
+
+
+#
+# Calculate the Wilcoxon Signed-Rank Test Results with the Bonferroni Correction
+#
+
+import pandas as pd
+from functools import reduce
+import scipy.stats as stats
+import numpy as np
+
+firstrun = pd.read_excel(r'output/run1_ratio.xlsx')
+secondrun = pd.read_excel(r'output/run2_ratio.xlsx')
+thirdrun = pd.read_excel(r'output/run3_ratio.xlsx')
+fourthrun = pd.read_excel(r'output/run4_ratio.xlsx')
+
+dfs = [firstrun[['filename', 'rtt_mean']], secondrun[['filename', 'rtt_mean']], thirdrun[['filename', 'rtt_mean']], fourthrun[['filename', 'rtt_mean']]]
+
+allrtts = reduce(lambda left, right: pd.merge(left, right, on='filename', how='outer'), dfs)
+
+comp14 = stats.wilcoxon(allrtts['run1'].tolist(), allrtts['run4'].tolist())
+comp24 = stats.wilcoxon(allrtts['run2'].tolist(), allrtts['run4'].tolist())
+comp34 = stats.wilcoxon(allrtts['run3'].tolist(), allrtts['run4'].tolist())
+comp12 = stats.wilcoxon(allrtts['run1'].tolist(), allrtts['run2'].tolist())
+comp13 = stats.wilcoxon(allrtts['run1'].tolist(), allrtts['run3'].tolist())
+comp23 = stats.wilcoxon(allrtts['run2'].tolist(), allrtts['run3'].tolist())
+
+print("Wilcoxon Result comparing run1 to run4. Statistic: {}, Pvalue: {}".format(comp14.statistic, comp14.pvalue))
+print("Wilcoxon Result comparing run2 to run4. Statistic: {}, Pvalue: {}".format(comp24.statistic, comp24.pvalue))
+print("Wilcoxon Result comparing run3 to run4. Statistic: {}, Pvalue: {}".format(comp34.statistic, comp34.pvalue))
+print("Wilcoxon Result comparing run1 to run2. Statistic: {}, Pvalue: {}".format(comp12.statistic, comp12.pvalue))
+print("Wilcoxon Result comparing run1 to run3. Statistic: {}, Pvalue: {}".format(comp13.statistic, comp13.pvalue))
+print("Wilcoxon Result comparing run2 to run3. Statistic: {}, Pvalue: {}".format(comp23.statistic, comp23.pvalue))
+
+
+ps = [comp14.pvalue, comp24.pvalue, comp34.pvalue, comp12.pvalue, comp13.pvalue, comp23.pvalue]
+print("The Bonferroni correction adjusts the Pvalues to the following {}".format(np.array(ps) * len(ps)))
+
+#
+# This script calculates the KL Divergence dataset for Chapter 4
+#
+
+from traceback import format_tb
+from scipy.special import rel_entr
+import numpy as np
+from functools import reduce
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy import stats
+from statsmodels.stats import rates
+import sys
+from traceback import format_tb
+from scipy.special import rel_entr
+import numpy as np
+from functools import reduce
+import pingouin as pg
+
+firstrun = pd.read_excel(r'output/run1_ratio.xlsx')
+secondrun = pd.read_excel(r'output/run2_ratio.xlsx')
+thirdrun = pd.read_excel(r'output/run3_ratio.xlsx')
+fourthrun = pd.read_excel(r'output/run4_ratio.xlsx')
+mwdf = pd.read_csv(r'working/mw_list.csv')
+
+
+Q = pd.concat((firstrun, secondrun, thirdrun, fourthrun)).groupby('filename')['crypto', 'exception', 'file', 'network', 'misc', 'netapi', 'notification', 'ole', 'process', 'registry', 'resource', 'services', 'synchronisation', 'system', 'ui'].mean()
+firstrun.set_index('filename', inplace=True)
+secondrun.set_index('filename', inplace=True)
+thirdrun.set_index('filename', inplace=True)
+fourthrun.set_index('filename', inplace=True)
+
+temp_list = []
+P=firstrun[['crypto', 'exception', 'file', 'network', 'misc', 'netapi', 'notification', 'ole', 'process', 'registry', 'resource', 'services', 'synchronisation', 'system', 'ui']]
+for index, row in Q.iterrows():
+    if index in P.index.values: 
+        temp_list.append({'filename':index, '1strun':np.sum(rel_entr(P.loc[[index]].to_numpy()/100, row.to_numpy()/100))})
+firstrun_df = pd.DataFrame(temp_list)
+temp_list = []
+P=secondrun[['crypto', 'exception', 'file', 'network', 'misc', 'netapi', 'notification', 'ole', 'process', 'registry', 'resource', 'services', 'synchronisation', 'system', 'ui']]
+for index, row in Q.iterrows():
+    if index in P.index.values: 
+        temp_list.append({'filename':index, '2ndrun':np.sum(rel_entr(P.loc[[index]].to_numpy()/100, row.to_numpy()/100))})
+secondrun_df = pd.DataFrame(temp_list)
+temp_list = []
+P=thirdrun[['crypto', 'exception', 'file', 'network', 'misc', 'netapi', 'notification', 'ole', 'process', 'registry', 'resource', 'services', 'synchronisation', 'system', 'ui']]
+for index, row in Q.iterrows():
+    if index in P.index.values: 
+        temp_list.append({'filename':index, '3rdrun':np.sum(rel_entr(P.loc[[index]].to_numpy()/100, row.to_numpy()/100))})
+thirdrun_df = pd.DataFrame(temp_list)
+temp_list = []
+P=fourthrun[['crypto', 'exception', 'file', 'network', 'misc', 'netapi', 'notification', 'ole', 'process', 'registry', 'resource', 'services', 'synchronisation', 'system', 'ui']]
+for index, row in Q.iterrows():
+    if index in P.index.values: 
+        temp_list.append({'filename':index, '4thrun':np.sum(rel_entr(P.loc[[index]].to_numpy()/100, row.to_numpy()/100))})
+fourthrun_df = pd.DataFrame(temp_list)
+dfs = [firstrun_df, secondrun_df, thirdrun_df, fourthrun_df]
+final_df = reduce(lambda  left,right: pd.merge(left,right,on=['filename'], how='outer'), dfs)
+final_df = final_df.merge(mwdf, how='inner', on='filename')
+final_df.to_excel(r'output/kldiverge.xlsx', index=False)
+
+
+#
+# This script calculates the Friedman's statistic for Chapter 4
+#
+
+
+
+kldf = pd.read_excel(r'output/kldiverge.xlsx')
+kldf = kldf.dropna()
+df_long = pd.melt(kldf.reset_index(), id_vars=['filename'], value_vars=['1strun', '2ndrun', '3rdrun', '4thrun'])
+df_long.columns = ['filename', 'runs', 'kldiverge']
+print(df_long.head(2))
+df_long.info()
+
+print(pg.friedman(data=df_long, dv="kldiverge", within="runs", subject="filename"))
