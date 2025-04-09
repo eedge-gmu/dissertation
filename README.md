@@ -1,4 +1,4 @@
-# dissertation
+# HONEYTRAP RESILIENCE: A STUDY OF MALWARE REDIRECTION AWARENESS
 
 The generated rawcounts datasets consist of 21 columns: 
 - tid 
